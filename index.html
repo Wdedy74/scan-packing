@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#ee4d2d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Scan Packing">
+<title>Scan Packing</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;font-family:system-ui,sans-serif;background:#f3f4f6;color:#111}
+header{background:#ee4d2d;color:#fff;padding:14px 16px;display:flex;justify-content:space-between;font-weight:700;font-size:17px}
+main{max-width:480px;margin:0 auto;padding:12px}
+label.l{font-size:13px;color:#555;display:block;margin:0 0 4px}
+input[type=text],input[type=password]{width:100%;padding:14px;font-size:18px;border:2px solid #ccc;border-radius:10px;background:#fff;color:#111}
+.scanbtn{display:block;width:100%;padding:30px 10px;border:0;border-radius:16px;background:#ee4d2d;color:#fff;font-size:26px;font-weight:800;box-shadow:0 3px 8px #0003;margin:0 0 10px}
+.scanbtn.on{background:#374151}
+.scan{display:block;text-align:center;margin:10px 0;padding:14px;border-radius:12px;background:#374151;color:#fff;font-size:17px;font-weight:700}
+.scan.off{opacity:.45;pointer-events:none}
+.hid{display:none}
+.camBox{position:relative;border-radius:14px;overflow:hidden;background:#000;margin-bottom:10px}
+#vid{width:100%;display:block;max-height:46vh;object-fit:cover}
+.frame{position:absolute;inset:16% 10%;border:3px solid #22c55eaa;border-radius:12px;pointer-events:none}
+.res{border-radius:16px;padding:22px 14px;text-align:center;margin-bottom:10px}
+.res .big{font-size:34px;font-weight:800;line-height:1.15}
+.res .sm{font-size:16px;margin-top:6px;word-break:break-all}
+.idle{background:#e5e7eb;color:#444}.ok{background:#16a34a;color:#fff}.err{background:#dc2626;color:#fff}.info{background:#2563eb;color:#fff}
+button.b{width:100%;padding:14px;font-size:16px;font-weight:700;border:0;border-radius:10px;background:#374151;color:#fff;margin-top:8px}
+button.red{background:#ee4d2d}button:disabled{opacity:.5}
+.card{background:#fff;border-radius:12px;padding:14px;margin-bottom:12px}
+details{background:#fff;border-radius:12px;padding:12px;margin-top:10px}
+summary{font-size:14px;color:#555}
+.small{font-size:12px;color:#777;margin:6px 0}
+</style></head><body>
+<header><span>📦 Scan Packing</span><span id="cnt">Hari ini: -</span></header>
+<main>
+  <div id="login" class="card" style="display:none">
+    <label class="l" for="code">Kode akses petugas</label>
+    <input type="password" id="code" autocomplete="off">
+    <button class="b red" id="btnLogin">Masuk</button>
+    <div id="loginMsg" class="small"></div>
+  </div>
+
+  <div id="app" style="display:none">
+    <div id="camBox" class="camBox" style="display:none"><video id="vid" playsinline muted autoplay></video><div class="frame"></div></div>
+    <button class="scanbtn" id="btnCam">📷 MULAI SCAN</button>
+    <div id="camMsg" class="small"></div>
+
+    <div id="res" class="res idle"><div class="big" id="rb">Siap scan</div><div class="sm" id="rs">Tekan MULAI SCAN, arahkan kamera ke label paket</div></div>
+    <button class="b" id="btnUndo" style="display:none">↩ Batalkan scan terakhir</button>
+
+    <label class="scan" id="photoBtn" for="fileScan">📷 Scan dari foto (cadangan)</label>
+    <input type="file" id="fileScan" class="hid" accept="image/*" capture="environment">
+
+    <details>
+      <summary>Ketik ID manual</summary>
+      <input type="text" id="manual" autocomplete="off" autocapitalize="off" placeholder="ID paket" style="margin-top:10px">
+      <label class="scan" id="manBtn" for="fileManual">📷 Foto &amp; Simpan</label>
+      <input type="file" id="fileManual" class="hid" accept="image/*" capture="environment">
+    </details>
+    <details>
+      <summary>⚙️ Admin: hapus data lama (&gt; 6 bulan)</summary>
+      <label class="l" style="margin-top:10px">PIN admin</label>
+      <input type="password" id="pin" autocomplete="off">
+      <button class="b" id="btnPreview">Cek data lama</button>
+      <div id="purgeMsg" class="small"></div>
+      <div id="purgeBox" style="display:none">
+        <label class="l">Ketik HAPUS untuk konfirmasi (data &amp; foto dihapus)</label>
+        <input type="text" id="word" autocomplete="off">
+        <button class="b red" id="btnPurge">Hapus permanen</button>
+      </div>
+    </details>
+    <details>
+      <summary>Pengaturan</summary>
+      <button class="b" id="btnLogout">Ganti kode akses</button>
+    </details>
+    <div id="dec" class="small"></div>
+  </div>
+</main>
+
+<script>
+// Alamat Web App Apps Script (berakhiran /exec). Ubah di sini jika Anda membuat deployment baru.
+const API_URL = 'https://script.google.com/macros/s/AKfycby1SvvZzsrETa2lhQoIR5zNgf83j93ukVh8PcYWemtz-Gz3VRlzwA0qJtNg3iN6UQFcNw/exec';
+
+const $ = id => document.getElementById(id);
+let busy = false, lastId = '', det = null, zxReaders = null;
+let stream = null, scanning = false, timer = null, seenKey = '', misses = 0, accessCode = '';
+const work = document.createElement('canvas');
+try { accessCode = localStorage.getItem('akses') || ''; } catch (e) {}
+
+function setBusy(b) { busy = b; $('photoBtn').className = 'scan' + (b ? ' off' : ''); $('manBtn').className = 'scan' + (b ? ' off' : ''); }
+function res(kind, big, sm) { $('res').className = 'res ' + kind; $('rb').textContent = big; $('rs').textContent = sm || ''; }
+function beep(ok) {
+  try {
+    if (navigator.vibrate) navigator.vibrate(ok ? 100 : [200, 100, 200]);
+    const a = new (window.AudioContext || window.webkitAudioContext)(), o = a.createOscillator();
+    o.frequency.value = ok ? 880 : 220; o.connect(a.destination); o.start(); o.stop(a.currentTime + (ok ? 0.12 : 0.4));
+  } catch (e) {}
+}
+window.addEventListener('error', e => { try { res('err', '❌ Error di aplikasi', (e.message || '') + ' (baris ' + (e.lineno || '?') + ')'); } catch (x) {} });
+window.addEventListener('unhandledrejection', e => { try { res('err', '❌ Error di aplikasi', String(e.reason && e.reason.message || e.reason)); } catch (x) {} });
+
+// ===== Server (Apps Script) =====
+async function api(action, payload) {
+  const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const to = setTimeout(() => { if (ctrl) ctrl.abort(); }, 60000);
+  try {
+    const r = await fetch(API_URL, {method: 'POST', redirect: 'follow', signal: ctrl ? ctrl.signal : undefined,
+      body: JSON.stringify(Object.assign({action: action, code: accessCode}, payload || {}))});
+    const txt = await r.text();
+    try { return JSON.parse(txt); }
+    catch (e) { return {ok: false, denied: true, error: 'Server menolak akses. Cek deployment Apps Script: Jalankan sebagai "Saya", Akses "Siapa saja".'}; }
+  } catch (e) { return {ok: false, net: true, error: 'Koneksi terputus / internet lemah'}; }
+  finally { clearTimeout(to); }
+}
+
+// ===== Masuk =====
+function showLogin(msg) { stopCam(); $('login').style.display = 'block'; $('app').style.display = 'none'; $('loginMsg').textContent = msg || ''; }
+function authFail() { accessCode = ''; try { localStorage.removeItem('akses'); } catch (e) {} showLogin('Kode akses salah. Hubungi admin.'); }
+function enterApp(count) { $('login').style.display = 'none'; $('app').style.display = 'block'; if (count != null) $('cnt').textContent = 'Hari ini: ' + count + ' paket'; }
+async function refreshToday() {
+  const r = await api('today');
+  if (r.auth) { authFail(); return; }
+  if (r.ok) enterApp(r.count);
+  else { enterApp(null); res('err', r.denied ? '❌ Server menolak akses' : '❌ Tidak bisa terhubung', r.error || ''); }
+}
+$('btnLogin').onclick = async () => {
+  const v = $('code').value.trim(); if (!v) return;
+  accessCode = v; $('loginMsg').textContent = 'Memeriksa...';
+  const r = await api('today');
+  if (r.auth) { accessCode = ''; $('loginMsg').textContent = '❌ ' + (r.error || 'Kode akses salah'); return; }
+  if (!r.ok) { accessCode = ''; $('loginMsg').textContent = '❌ ' + (r.error || 'Gagal'); return; }
+  try { localStorage.setItem('akses', v); } catch (e) {}
+  $('code').value = ''; enterApp(r.count);
+};
+$('btnLogout').onclick = () => authFail();
+
+// ===== Pembaca kode: bawaan browser -> jsQR -> ZXing =====
+function loadScript(urls, done) {
+  if (!urls.length) { done(false); return; }
+  const s = document.createElement('script');
+  s.src = urls[0]; s.onload = () => done(true); s.onerror = () => loadScript(urls.slice(1), done);
+  document.head.appendChild(s);
+}
+function showDecoders() {
+  const l = [];
+  if (det) l.push('Native'); if (window.jsQR) l.push('jsQR'); if (window.ZXing) l.push('ZXing');
+  $('dec').textContent = 'Versi 6 (hosting) · Pembaca kode aktif: ' + (l.length ? l.join(', ') : 'belum ada (cek internet)');
+}
+try { if ('BarcodeDetector' in window) det = new BarcodeDetector(); } catch (e) { det = null; }
+loadScript(['https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js', 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js'], showDecoders);
+loadScript(['https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js', 'https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js'], showDecoders);
+showDecoders();
+
+function zxMake(formats) {
+  const hints = new Map(); hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats.map(f => ZXing.BarcodeFormat[f]).filter(x => x !== undefined));
+  const r = new ZXing.MultiFormatReader(); r.setHints(hints); return r;
+}
+function zxAll(c) {
+  const out = [];
+  if (!window.ZXing) return out;
+  try {
+    if (!zxReaders) zxReaders = [zxMake(['QR_CODE', 'DATA_MATRIX']), zxMake(['CODE_128', 'CODE_39', 'CODE_93', 'EAN_13', 'EAN_8', 'ITF', 'CODABAR', 'UPC_A'])];
+    const src = new ZXing.HTMLCanvasElementLuminanceSource(c);
+    zxReaders.forEach(rd => {
+      [ZXing.HybridBinarizer, ZXing.GlobalHistogramBinarizer].some(B => {
+        try { out.push(rd.decode(new ZXing.BinaryBitmap(new B(src))).getText()); return true; } catch (e) { return false; }
+      });
+    });
+  } catch (e) {}
+  return out;
+}
+async function decodeAll(c, deep) {
+  const out = [];
+  const add = t => { t = String(t || '').trim(); if (t && out.indexOf(t) < 0) out.push(t); };
+  if (det) { try { const r = await det.detect(c); r.forEach(b => add(b.rawValue)); } catch (e) {} }
+  if (window.jsQR) {
+    try {
+      const x = c.getContext('2d').getImageData(0, 0, c.width, c.height);
+      const q = jsQR(x.data, x.width, x.height, {inversionAttempts: deep ? 'attemptBoth' : 'dontInvert'});
+      if (q && q.data) add(q.data);
+    } catch (e) {}
+  }
+  zxAll(c).forEach(add);
+  return out;
+}
+
+// ===== Foto =====
+function loadImg(f) {
+  return new Promise((ok, no) => {
+    const r = new FileReader();
+    r.onerror = () => no(new Error('read'));
+    r.onload = () => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => no(new Error('decode')); i.src = r.result; };
+    r.readAsDataURL(f);
+  });
+}
+async function loadAny(f) {
+  try { if (window.createImageBitmap) return await createImageBitmap(f); } catch (e) {}
+  return loadImg(f);
+}
+function shrink(img, max) {
+  const s = Math.min(1, max / Math.max(img.width, img.height));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(img.width * s)); c.height = Math.max(1, Math.round(img.height * s));
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  return c;
+}
+function shotOf(img) { const d = shrink(img, 1024).toDataURL('image/jpeg', 0.7); return {b64: d.split(',')[1], mime: 'image/jpeg'}; }
+function rawShot(f) {
+  return new Promise((ok, no) => {
+    if (f.size > 8 * 1024 * 1024) { no(new Error('Foto terlalu besar, turunkan resolusi kamera')); return; }
+    const r = new FileReader();
+    r.onload = () => ok({b64: String(r.result).split(',')[1], mime: f.type || 'image/jpeg'});
+    r.onerror = () => no(new Error('Foto tidak bisa dibaca'));
+    r.readAsDataURL(f);
+  });
+}
+
+// ===== Simpan =====
+async function submit(ids, shot) {
+  setBusy(true); res('info', 'Menyimpan...', ids[0]); $('btnUndo').style.display = 'none'; lastId = '';
+  const r = await api('save', {data: {id: ids[0], ids: ids.slice(0, 6), photo: shot.b64, mime: shot.mime}});
+  setBusy(false);
+  if (r.auth) { authFail(); return; }
+  if (r.ok) {
+    lastId = r.id; $('cnt').textContent = 'Hari ini: ' + r.count + ' paket';
+    beep(true); res('ok', '✔ No. ' + r.no, r.id + ' · ' + (r.jasa || '⚠ kolom Kurir kosong')); $('btnUndo').style.display = 'block';
+  } else if (r.net) {
+    beep(false); res('err', '❌ Koneksi terputus', 'Scan ulang paket ini. Jika muncul SUDAH DISCAN, berarti sudah tersimpan.');
+    setTimeout(() => { seenKey = ''; }, 3000);
+  } else {
+    beep(false); res('err', r.dup ? '❌ SUDAH DISCAN' : '❌ Gagal', r.error || 'Coba lagi');
+  }
+}
+
+// ===== Kamera live =====
+async function startCam() {
+  if (scanning) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { $('camMsg').textContent = 'Browser ini tidak mendukung kamera live. Pakai "Scan dari foto".'; return; }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: {ideal: 'environment'}, width: {ideal: 1280}, height: {ideal: 720}}, audio: false});
+    $('vid').srcObject = stream; await $('vid').play();
+    scanning = true; seenKey = ''; misses = 0; $('camMsg').textContent = '';
+    $('camBox').style.display = 'block'; $('btnCam').textContent = '⏹ BERHENTI SCAN'; $('btnCam').className = 'scanbtn on';
+    res('idle', 'Kamera aktif', 'Arahkan ke label paket, tahan sebentar'); loop();
+  } catch (e) {
+    stopCam();
+    $('camMsg').textContent = 'Kamera tidak bisa dibuka (' + (e && e.name || 'error') + '). Izinkan kamera di browser, atau pakai "Scan dari foto".';
+  }
+}
+function stopCam() {
+  scanning = false; clearTimeout(timer); seenKey = '';
+  if (stream) { try { stream.getTracks().forEach(t => t.stop()); } catch (e) {} stream = null; }
+  try { $('vid').srcObject = null; } catch (e) {}
+  $('camBox').style.display = 'none'; $('btnCam').textContent = '📷 MULAI SCAN'; $('btnCam').className = 'scanbtn';
+}
+function loop() {
+  timer = setTimeout(async () => {
+    if (!scanning) return;
+    try {
+      const v = $('vid');
+      if (!busy && v.videoWidth) {
+        work.width = v.videoWidth; work.height = v.videoHeight;
+        work.getContext('2d', {willReadFrequently: true}).drawImage(v, 0, 0);
+        const ids = await decodeAll(work, false);
+        if (ids.length) {
+          misses = 0;
+          const key = ids.join('|');
+          if (key !== seenKey && !busy && scanning) { seenKey = key; submit(ids, shotOf(work)); }
+        } else if (++misses >= 3) { seenKey = ''; }   // kode sudah hilang dari layar -> boleh dibaca lagi
+      }
+    } catch (e) {}
+    if (scanning) loop();
+  }, 300);
+}
+$('btnCam').onclick = () => { if (scanning) stopCam(); else startCam(); };
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopCam(); });
+
+// ===== Foto (cadangan) & manual =====
+function guard(e, needId) {
+  if (busy) { e.preventDefault(); return; }
+  if (needId && !$('manual').value.trim()) { e.preventDefault(); beep(false); res('err', 'Isi ID paket dulu', 'Ketik ID di kolom, lalu tekan Foto & Simpan'); }
+}
+$('fileScan').addEventListener('click', e => guard(e, false));
+$('fileManual').addEventListener('click', e => guard(e, true));
+
+$('fileScan').onchange = async e => {
+  const f = e.target.files[0]; e.target.value = '';
+  if (!f || busy) return;
+  setBusy(true); res('info', 'Membaca kode...', '');
+  try {
+    await new Promise(r => setTimeout(r, 0));
+    const img = await loadAny(f);
+    const passes = [[1000, false], [640, false], [1600, true], [2400, true]];
+    let ids = [];
+    for (let i = 0; i < passes.length && !ids.length; i++) {
+      ids = await decodeAll(shrink(img, passes[i][0]), passes[i][1]);
+      if (!ids.length) await new Promise(r => setTimeout(r, 0));
+    }
+    if (!ids.length) { setBusy(false); beep(false); res('err', '❌ Kode tidak terbaca', 'Foto lebih dekat & terang, lalu scan ulang'); return; }
+    await submit(ids, shotOf(img));
+  } catch (x) {
+    setBusy(false); beep(false); res('err', '❌ Foto tidak bisa dibuka', (x && x.message || 'error') + ' - ulangi scan');
+  }
+};
+$('fileManual').onchange = async e => {
+  const f = e.target.files[0]; e.target.value = '';
+  if (!f || busy) return;
+  const id = $('manual').value.trim();
+  if (!id) { res('err', 'Isi ID paket dulu', ''); return; }
+  setBusy(true); res('info', 'Memproses foto...', id);
+  let shot;
+  try { shot = shotOf(await loadAny(f)); } catch (x) {
+    try { shot = await rawShot(f); } catch (y) { setBusy(false); res('err', '❌ Foto gagal', y.message); return; }
+  }
+  $('manual').value = ''; await submit([id], shot);
+};
+
+// ===== Batal =====
+$('btnUndo').onclick = async () => {
+  if (!lastId || busy) return;
+  const id = lastId; setBusy(true); res('info', 'Membatalkan...', id);
+  const r = await api('undo', {id: id});
+  setBusy(false);
+  if (r.auth) { authFail(); return; }
+  if (r.ok) { lastId = ''; $('btnUndo').style.display = 'none'; $('cnt').textContent = 'Hari ini: ' + r.count + ' paket'; res('idle', 'Dibatalkan', id + ' bisa discan ulang'); seenKey = ''; }
+  else res('err', '❌ Gagal batal', r.error || 'Coba lagi');
+};
+
+// ===== Admin: hapus data lama =====
+function purgeMsg(t) { $('purgeMsg').textContent = t; }
+$('btnPreview').onclick = async () => {
+  $('purgeBox').style.display = 'none'; purgeMsg('Memeriksa...'); $('btnPreview').disabled = true;
+  const r = await api('previewPurge', {pin: $('pin').value});
+  $('btnPreview').disabled = false;
+  if (r.auth) { authFail(); return; }
+  if (!r.ok) { purgeMsg('❌ ' + (r.error || 'Gagal')); return; }
+  if (!r.count) { purgeMsg('✔ Tidak ada data lebih lama dari ' + r.cutoff); return; }
+  purgeMsg(r.count + ' data lebih lama dari ' + r.cutoff + ' akan dihapus permanen (beserta fotonya).');
+  $('word').value = ''; $('purgeBox').style.display = 'block';
+};
+$('btnPurge').onclick = async () => {
+  if ($('word').value.trim().toUpperCase() !== 'HAPUS') { purgeMsg('Ketik HAPUS untuk konfirmasi.'); return; }
+  $('btnPurge').disabled = true; purgeMsg('Menghapus, mohon tunggu...');
+  const r = await api('purge', {pin: $('pin').value});
+  $('btnPurge').disabled = false; $('purgeBox').style.display = 'none'; $('word').value = '';
+  if (r.auth) { authFail(); return; }
+  if (!r.ok) { purgeMsg('❌ ' + (r.error || 'Gagal')); return; }
+  purgeMsg('✔ ' + r.deleted + ' data dihapus, ' + r.photos + ' foto dipindah ke sampah Drive.' + (r.remaining ? ' Masih ada ' + r.remaining + ' data lama, tekan "Cek data lama" lalu hapus lagi.' : ''));
+};
+
+// ===== Mulai =====
+if (accessCode) refreshToday(); else showLogin('');
+</script></body></html>
