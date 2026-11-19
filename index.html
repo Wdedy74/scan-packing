@@ -31,6 +31,7 @@ button.red{background:#ee4d2d}button:disabled{opacity:.5}
 details{background:#fff;border-radius:12px;padding:12px;margin-top:10px}
 summary{font-size:14px;color:#555}
 .small{font-size:12px;color:#777;margin:6px 0}
+#loginMsg{white-space:pre-line}
 </style></head><body>
 <header><span>📦 Scan Packing</span><span id="cnt">Hari ini: -</span></header>
 <main>
@@ -38,12 +39,14 @@ summary{font-size:14px;color:#555}
     <label class="l" for="code">Kode akses petugas</label>
     <input type="password" id="code" autocomplete="off">
     <button class="b red" id="btnLogin">Masuk</button>
+    <button class="b" id="btnDiag" style="background:#6b7280">Tes koneksi</button>
     <div id="loginMsg" class="small"></div>
   </div>
 
   <div id="app" style="display:none">
     <div id="camBox" class="camBox" style="display:none"><video id="vid" playsinline muted autoplay></video><div class="frame"></div></div>
     <button class="scanbtn" id="btnCam">📷 MULAI SCAN</button>
+    <button class="b" id="btnTorch" style="display:none">💡 Senter</button>
     <div id="camMsg" class="small"></div>
 
     <div id="res" class="res idle"><div class="big" id="rb">Siap scan</div><div class="sm" id="rs">Tekan MULAI SCAN, arahkan kamera ke label paket</div></div>
@@ -84,8 +87,8 @@ const API_URL = 'https://script.google.com/macros/s/AKfycby1SvvZzsrETa2lhQoIR5zN
 
 const $ = id => document.getElementById(id);
 let busy = false, lastId = '', det = null, zxReaders = null;
-let stream = null, scanning = false, timer = null, seenKey = '', misses = 0, accessCode = '';
-const work = document.createElement('canvas');
+let stream = null, scanning = false, timer = null, seen = [], prev = [], misses = 0, accessCode = '', useFrame = false, torchOn = false;
+const work = document.createElement('canvas'), dwork = document.createElement('canvas');
 try { accessCode = localStorage.getItem('akses') || ''; } catch (e) {}
 
 function setBusy(b) { busy = b; $('photoBtn').className = 'scan' + (b ? ' off' : ''); $('manBtn').className = 'scan' + (b ? ' off' : ''); }
@@ -100,18 +103,48 @@ function beep(ok) {
 window.addEventListener('error', e => { try { res('err', '❌ Error di aplikasi', (e.message || '') + ' (baris ' + (e.lineno || '?') + ')'); } catch (x) {} });
 window.addEventListener('unhandledrejection', e => { try { res('err', '❌ Error di aplikasi', String(e.reason && e.reason.message || e.reason)); } catch (x) {} });
 
-// ===== Server (Apps Script) =====
-async function api(action, payload) {
+// ===== Server (Apps Script): jalur 1 = fetch, jalur 2 (cadangan) = form + iframe =====
+async function apiFetch(action, payload, ms) {
   const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-  const to = setTimeout(() => { if (ctrl) ctrl.abort(); }, 60000);
+  const to = setTimeout(() => { if (ctrl) ctrl.abort(); }, ms);
   try {
     const r = await fetch(API_URL, {method: 'POST', redirect: 'follow', signal: ctrl ? ctrl.signal : undefined,
       body: JSON.stringify(Object.assign({action: action, code: accessCode}, payload || {}))});
     const txt = await r.text();
     try { return JSON.parse(txt); }
     catch (e) { return {ok: false, denied: true, error: 'Server menolak akses. Cek deployment Apps Script: Jalankan sebagai "Saya", Akses "Siapa saja".'}; }
-  } catch (e) { return {ok: false, net: true, error: 'Koneksi terputus / internet lemah'}; }
+  } catch (e) { return {ok: false, net: true, error: 'Tidak bisa menghubungi server'}; }
   finally { clearTimeout(to); }
+}
+function apiFrame(action, payload, ms) {
+  return new Promise(resolve => {
+    const cb = 'c' + Date.now() + Math.random().toString(36).slice(2, 8), name = 'f_' + cb;
+    const iframe = document.createElement('iframe'); iframe.name = name; iframe.style.display = 'none';
+    const form = document.createElement('form'); form.method = 'POST'; form.action = API_URL; form.target = name; form.style.display = 'none';
+    const add = (k, v) => { const i = document.createElement('input'); i.type = 'hidden'; i.name = k; i.value = v; form.appendChild(i); };
+    add('via', 'frame'); add('cb', cb);
+    add('req', JSON.stringify(Object.assign({action: action, code: accessCode}, payload || {})));
+    let done = false, to = null;
+    const finish = r => {
+      if (done) return; done = true; clearTimeout(to); window.removeEventListener('message', on);
+      try { iframe.remove(); form.remove(); } catch (e) {}
+      resolve(r);
+    };
+    const on = ev => { const d = ev.data; if (d && d.sp === 1 && d.cb === cb) finish(d.res); };
+    to = setTimeout(() => finish({ok: false, net: true, error: 'Tidak bisa menghubungi server'}), ms);
+    window.addEventListener('message', on);
+    document.body.appendChild(iframe); document.body.appendChild(form);
+    try { form.submit(); } catch (e) { finish({ok: false, net: true, error: 'Tidak bisa menghubungi server'}); }
+  });
+}
+async function api(action, payload, ms) {
+  ms = ms || 60000;
+  if (useFrame) return apiFrame(action, payload, ms);
+  const r = await apiFetch(action, payload, ms);
+  if (!r.net) return r;
+  const f = await apiFrame(action, payload, ms);          // jalur cadangan
+  if (f.net) { f.error = navigator.onLine === false ? 'Tidak ada internet' : 'Tidak bisa menghubungi server Apps Script. Cek sinyal, atau deployment harus "Siapa saja" + New version.'; return f; }
+  useFrame = true; f.viaRetry = true; return f;
 }
 
 // ===== Masuk =====
@@ -119,7 +152,7 @@ function showLogin(msg) { stopCam(); $('login').style.display = 'block'; $('app'
 function authFail() { accessCode = ''; try { localStorage.removeItem('akses'); } catch (e) {} showLogin('Kode akses salah. Hubungi admin.'); }
 function enterApp(count) { $('login').style.display = 'none'; $('app').style.display = 'block'; if (count != null) $('cnt').textContent = 'Hari ini: ' + count + ' paket'; }
 async function refreshToday() {
-  const r = await api('today');
+  const r = await api('today', {}, 20000);
   if (r.auth) { authFail(); return; }
   if (r.ok) enterApp(r.count);
   else { enterApp(null); res('err', r.denied ? '❌ Server menolak akses' : '❌ Tidak bisa terhubung', r.error || ''); }
@@ -127,13 +160,22 @@ async function refreshToday() {
 $('btnLogin').onclick = async () => {
   const v = $('code').value.trim(); if (!v) return;
   accessCode = v; $('loginMsg').textContent = 'Memeriksa...';
-  const r = await api('today');
+  const r = await api('today', {}, 20000);
   if (r.auth) { accessCode = ''; $('loginMsg').textContent = '❌ ' + (r.error || 'Kode akses salah'); return; }
   if (!r.ok) { accessCode = ''; $('loginMsg').textContent = '❌ ' + (r.error || 'Gagal'); return; }
   try { localStorage.setItem('akses', v); } catch (e) {}
   $('code').value = ''; enterApp(r.count);
 };
 $('btnLogout').onclick = () => authFail();
+$('btnDiag').onclick = async () => {
+  const L = [], out = t => { L.push(t); $('loginMsg').textContent = L.join('\n'); };
+  const st = r => r.net ? 'GAGAL' : r.denied ? 'dibalas HTML (akses belum "Siapa saja"?)' : r.auth ? 'tersambung (kode akses kosong/salah)' : r.ok ? 'OK' : 'balasan: ' + (r.error || '');
+  out('Internet: ' + (navigator.onLine === false ? 'OFFLINE' : 'online'));
+  try { const r = await fetch(API_URL, {redirect: 'follow'}); const t = await r.text(); out('GET: HTTP ' + r.status + ' ' + t.slice(0, 50).replace(/\s+/g, ' ')); }
+  catch (e) { out('GET gagal: ' + (e && e.name) + ' ' + (e && e.message)); }
+  out('Jalur fetch: ' + st(await apiFetch('today', {}, 20000)));
+  out('Jalur iframe: ' + st(await apiFrame('today', {}, 20000)));
+};
 
 // ===== Pembaca kode: bawaan browser -> jsQR -> ZXing =====
 function loadScript(urls, done) {
@@ -206,7 +248,7 @@ function shrink(img, max) {
   c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
   return c;
 }
-function shotOf(img) { const d = shrink(img, 1024).toDataURL('image/jpeg', 0.7); return {b64: d.split(',')[1], mime: 'image/jpeg'}; }
+function shotOf(img) { const d = shrink(img, 1280).toDataURL('image/jpeg', 0.72); return {b64: d.split(',')[1], mime: 'image/jpeg'}; }
 function rawShot(f) {
   return new Promise((ok, no) => {
     if (f.size > 8 * 1024 * 1024) { no(new Error('Foto terlalu besar, turunkan resolusi kamera')); return; }
@@ -223,12 +265,15 @@ async function submit(ids, shot) {
   const r = await api('save', {data: {id: ids[0], ids: ids.slice(0, 6), photo: shot.b64, mime: shot.mime}});
   setBusy(false);
   if (r.auth) { authFail(); return; }
-  if (r.ok) {
-    lastId = r.id; $('cnt').textContent = 'Hari ini: ' + r.count + ' paket';
-    beep(true); res('ok', '✔ No. ' + r.no, r.id + ' · ' + (r.jasa || '⚠ kolom Kurir kosong')); $('btnUndo').style.display = 'block';
+  // jika jalur pertama sempat terkirim tapi balasannya terblokir, kirim ulang akan dibalas "sudah discan": itu berarti BERHASIL
+  const okRetry = r.dup && r.viaRetry && r.age != null && r.age >= 0 && r.age < 180;
+  if (r.ok || okRetry) {
+    lastId = r.id || ids[0];
+    if (r.ok) $('cnt').textContent = 'Hari ini: ' + r.count + ' paket'; else refreshToday();
+    beep(true); res('ok', '✔ No. ' + (r.no || '?'), lastId + ' · ' + (r.jasa || '⚠ kolom Kurir kosong')); $('btnUndo').style.display = 'block';
   } else if (r.net) {
-    beep(false); res('err', '❌ Koneksi terputus', 'Scan ulang paket ini. Jika muncul SUDAH DISCAN, berarti sudah tersimpan.');
-    setTimeout(() => { seenKey = ''; }, 3000);
+    beep(false); res('err', '❌ Koneksi terputus', (r.error || '') + ' Scan ulang paket ini. Jika muncul SUDAH DISCAN, berarti sudah tersimpan.');
+    setTimeout(() => { seen = []; prev = []; }, 3000);
   } else {
     beep(false); res('err', r.dup ? '❌ SUDAH DISCAN' : '❌ Gagal', r.error || 'Coba lagi');
   }
@@ -239,9 +284,14 @@ async function startCam() {
   if (scanning) return;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { $('camMsg').textContent = 'Browser ini tidak mendukung kamera live. Pakai "Scan dari foto".'; return; }
   try {
-    stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: {ideal: 'environment'}, width: {ideal: 1280}, height: {ideal: 720}}, audio: false});
+    stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: {ideal: 'environment'}, width: {ideal: 1920}, height: {ideal: 1080}}, audio: false});
     $('vid').srcObject = stream; await $('vid').play();
-    scanning = true; seenKey = ''; misses = 0; $('camMsg').textContent = '';
+    try {   // fokus otomatis terus-menerus & senter (jika HP mendukung)
+      const tr = stream.getVideoTracks()[0], cap = (tr.getCapabilities && tr.getCapabilities()) || {};
+      if (cap.focusMode && cap.focusMode.indexOf('continuous') >= 0) tr.applyConstraints({advanced: [{focusMode: 'continuous'}]}).catch(() => {});
+      torchOn = false; $('btnTorch').style.display = cap.torch ? 'block' : 'none';
+    } catch (e) {}
+    scanning = true; seen = []; prev = []; misses = 0; $('camMsg').textContent = '';
     $('camBox').style.display = 'block'; $('btnCam').textContent = '⏹ BERHENTI SCAN'; $('btnCam').className = 'scanbtn on';
     res('idle', 'Kamera aktif', 'Arahkan ke label paket, tahan sebentar'); loop();
   } catch (e) {
@@ -250,11 +300,15 @@ async function startCam() {
   }
 }
 function stopCam() {
-  scanning = false; clearTimeout(timer); seenKey = '';
+  scanning = false; clearTimeout(timer); seen = []; prev = [];
   if (stream) { try { stream.getTracks().forEach(t => t.stop()); } catch (e) {} stream = null; }
   try { $('vid').srcObject = null; } catch (e) {}
-  $('camBox').style.display = 'none'; $('btnCam').textContent = '📷 MULAI SCAN'; $('btnCam').className = 'scanbtn';
+  $('camBox').style.display = 'none'; $('btnTorch').style.display = 'none';
+  $('btnCam').textContent = '📷 MULAI SCAN'; $('btnCam').className = 'scanbtn';
 }
+$('btnTorch').onclick = () => {
+  try { const tr = stream.getVideoTracks()[0]; torchOn = !torchOn; tr.applyConstraints({advanced: [{torch: torchOn}]}).catch(() => {}); } catch (e) {}
+};
 function loop() {
   timer = setTimeout(async () => {
     if (!scanning) return;
@@ -262,17 +316,22 @@ function loop() {
       const v = $('vid');
       if (!busy && v.videoWidth) {
         work.width = v.videoWidth; work.height = v.videoHeight;
-        work.getContext('2d', {willReadFrequently: true}).drawImage(v, 0, 0);
-        const ids = await decodeAll(work, false);
+        work.getContext('2d', {willReadFrequently: true}).drawImage(v, 0, 0);       // bingkai penuh = foto bukti
+        const s = Math.min(1, 960 / Math.max(work.width, work.height));              // dibaca di ukuran lebih kecil = lebih cepat
+        dwork.width = Math.max(1, Math.round(work.width * s)); dwork.height = Math.max(1, Math.round(work.height * s));
+        dwork.getContext('2d', {willReadFrequently: true}).drawImage(work, 0, 0, dwork.width, dwork.height);
+        const ids = await decodeAll(dwork, false);
         if (ids.length) {
           misses = 0;
-          const key = ids.join('|');
-          if (key !== seenKey && !busy && scanning) { seenKey = key; submit(ids, shotOf(work)); }
-        } else if (++misses >= 3) { seenKey = ''; }   // kode sudah hilang dari layar -> boleh dibaca lagi
+          const known = ids.some(x => seen.indexOf(x) >= 0);                         // paket yang baru disimpan, masih di layar
+          const twice = ids.some(x => prev.indexOf(x) >= 0);                         // terbaca 2x berturut-turut = akurat
+          prev = ids;
+          if (!known && twice && !busy && scanning) { seen = ids.slice(); submit(ids, shotOf(work)); }
+        } else if (++misses >= 3) { seen = []; prev = []; }                          // kode sudah hilang dari layar
       }
     } catch (e) {}
     if (scanning) loop();
-  }, 300);
+  }, 250);
 }
 $('btnCam').onclick = () => { if (scanning) stopCam(); else startCam(); };
 document.addEventListener('visibilitychange', () => { if (document.hidden) stopCam(); });
@@ -324,7 +383,7 @@ $('btnUndo').onclick = async () => {
   const r = await api('undo', {id: id});
   setBusy(false);
   if (r.auth) { authFail(); return; }
-  if (r.ok) { lastId = ''; $('btnUndo').style.display = 'none'; $('cnt').textContent = 'Hari ini: ' + r.count + ' paket'; res('idle', 'Dibatalkan', id + ' bisa discan ulang'); seenKey = ''; }
+  if (r.ok) { lastId = ''; $('btnUndo').style.display = 'none'; $('cnt').textContent = 'Hari ini: ' + r.count + ' paket'; res('idle', 'Dibatalkan', id + ' bisa discan ulang'); seen = []; prev = []; }
   else res('err', '❌ Gagal batal', r.error || 'Coba lagi');
 };
 
