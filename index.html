@@ -32,6 +32,7 @@ details{background:#fff;border-radius:12px;padding:12px;margin-top:10px}
 summary{font-size:14px;color:#555}
 .small{font-size:12px;color:#777;margin:6px 0}
 #loginMsg{white-space:pre-line}
+.hist{white-space:pre-line;font-size:13px;color:#444;margin:0 0 10px;line-height:1.5}
 </style></head><body>
 <header><span>📦 Scan Packing</span><span id="cnt">Hari ini: -</span></header>
 <main>
@@ -50,6 +51,7 @@ summary{font-size:14px;color:#555}
     <div id="camMsg" class="small"></div>
 
     <div id="res" class="res idle"><div class="big" id="rb">Siap scan</div><div class="sm" id="rs">Tekan MULAI SCAN, arahkan kamera ke label paket</div></div>
+    <div id="hist" class="hist"></div>
     <button class="b" id="btnUndo" style="display:none">↩ Batalkan scan terakhir</button>
 
     <label class="scan" id="photoBtn" for="fileScan">📷 Scan dari foto (cadangan)</label>
@@ -86,7 +88,8 @@ summary{font-size:14px;color:#555}
 const API_URL = 'https://script.google.com/macros/s/AKfycby1SvvZzsrETa2lhQoIR5zNgf83j93ukVh8PcYWemtz-Gz3VRlzwA0qJtNg3iN6UQFcNw/exec';
 
 const $ = id => document.getElementById(id);
-let busy = false, lastId = '', det = null, zxReaders = null;
+let busy = false, lastId = '', det = null, zxReaders = null, undoing = false, working = false, pingTimer = null;
+const queue = [], hist = [], known = {};
 let stream = null, scanning = false, timer = null, seen = [], prev = [], misses = 0, accessCode = '', useFrame = false, torchOn = false;
 const work = document.createElement('canvas'), dwork = document.createElement('canvas');
 try { accessCode = localStorage.getItem('akses') || ''; } catch (e) {}
@@ -199,32 +202,40 @@ function zxMake(formats) {
   hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats.map(f => ZXing.BarcodeFormat[f]).filter(x => x !== undefined));
   const r = new ZXing.MultiFormatReader(); r.setHints(hints); return r;
 }
-function zxAll(c) {
+function plainLike(s) { return /^[A-Za-z0-9._\/-]{6,60}$/.test(s); }
+function zxAll(c) {   // [{t, qr}] : qr=true untuk QR/DataMatrix
   const out = [];
   if (!window.ZXing) return out;
   try {
     if (!zxReaders) zxReaders = [zxMake(['QR_CODE', 'DATA_MATRIX']), zxMake(['CODE_128', 'CODE_39', 'CODE_93', 'EAN_13', 'EAN_8', 'ITF', 'CODABAR', 'UPC_A'])];
     const src = new ZXing.HTMLCanvasElementLuminanceSource(c);
-    zxReaders.forEach(rd => {
+    zxReaders.forEach((rd, ri) => {
       [ZXing.HybridBinarizer, ZXing.GlobalHistogramBinarizer].some(B => {
-        try { out.push(rd.decode(new ZXing.BinaryBitmap(new B(src))).getText()); return true; } catch (e) { return false; }
+        try { out.push({t: rd.decode(new ZXing.BinaryBitmap(new B(src))).getText(), qr: ri === 0}); return true; } catch (e) { return false; }
       });
     });
   } catch (e) {}
   return out;
 }
-async function decodeAll(c, deep) {
-  const out = [];
-  const add = t => { t = String(t || '').trim(); if (t && out.indexOf(t) < 0) out.push(t); };
-  if (det) { try { const r = await det.detect(c); r.forEach(b => add(b.rawValue)); } catch (e) {} }
+// Semua kode di gambar. out.strong = ada QR berisi ID yang jelas (kebal salah baca -> boleh langsung disimpan)
+// fast = berhenti lebih awal bila QR sudah ketemu (tidak menjalankan pembaca barcode batang yang lebih berat)
+async function decodeAll(c, deep, fast) {
+  const out = []; out.strong = false;
+  const add = (t, strong) => {
+    t = String(t || '').trim(); if (!t) return;
+    if (out.indexOf(t) < 0) out.push(t);
+    if (strong && plainLike(t)) out.strong = true;
+  };
+  if (det) { try { const r = await det.detect(c); r.forEach(b => add(b.rawValue, b.format === 'qr_code' || b.format === 'data_matrix')); } catch (e) {} }
   if (window.jsQR) {
     try {
       const x = c.getContext('2d').getImageData(0, 0, c.width, c.height);
       const q = jsQR(x.data, x.width, x.height, {inversionAttempts: deep ? 'attemptBoth' : 'dontInvert'});
-      if (q && q.data) add(q.data);
+      if (q && q.data) add(q.data, true);
     } catch (e) {}
   }
-  zxAll(c).forEach(add);
+  if (fast && out.strong) return out;
+  zxAll(c).forEach(o => add(o.t, o.qr));
   return out;
 }
 
@@ -248,7 +259,7 @@ function shrink(img, max) {
   c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
   return c;
 }
-function shotOf(img) { const d = shrink(img, 1280).toDataURL('image/jpeg', 0.72); return {b64: d.split(',')[1], mime: 'image/jpeg'}; }
+function shotOf(img) { const d = shrink(img, 1024).toDataURL('image/jpeg', 0.7); return {b64: d.split(',')[1], mime: 'image/jpeg'}; }
 function rawShot(f) {
   return new Promise((ok, no) => {
     if (f.size > 8 * 1024 * 1024) { no(new Error('Foto terlalu besar, turunkan resolusi kamera')); return; }
@@ -259,24 +270,54 @@ function rawShot(f) {
   });
 }
 
-// ===== Simpan =====
-async function submit(ids, shot) {
-  setBusy(true); res('info', 'Menyimpan...', ids[0]); $('btnUndo').style.display = 'none'; lastId = '';
-  const r = await api('save', {data: {id: ids[0], ids: ids.slice(0, 6), photo: shot.b64, mime: shot.mime}});
-  setBusy(false);
-  if (r.auth) { authFail(); return; }
-  // jika jalur pertama sempat terkirim tapi balasannya terblokir, kirim ulang akan dibalas "sudah discan": itu berarti BERHASIL
+// ===== Simpan: masuk antrean, kamera tetap lanjut scan paket berikutnya =====
+function renderHist() { $('hist').textContent = hist.slice(0, 6).map(x => x.t).join('\n'); }
+function plainKeys(ids) { return ids.filter(plainLike).map(x => x.toUpperCase()); }
+function enqueue(ids, shot) {
+  const pk = plainKeys(ids);
+  if (pk.length && pk.every(k => known[k])) {      // sudah discan di sesi ini: tolak seketika tanpa ke server
+    beep(false); res('err', '❌ SUDAH DISCAN', ids[0] + ' (baru saja di-scan)'); return false;
+  }
+  pk.forEach(k => { known[k] = 1; });
+  const h = {s: 'wait', t: '⏳ ' + ids[0] + ' - menyimpan...'};
+  hist.unshift(h); if (hist.length > 8) hist.pop();
+  queue.push({ids: ids, shot: shot, h: h});
+  renderHist(); res('info', 'Menyimpan...', ids[0] + (queue.length > 1 ? ' (antrean ' + queue.length + ')' : ''));
+  pump(); return true;
+}
+async function pump() {
+  if (working) return; working = true;
+  try {
+    while (queue.length) {
+      const it = queue[0];
+      const r = await api('save', {data: {id: it.ids[0], ids: it.ids.slice(0, 6), photo: it.shot.b64, mime: it.shot.mime}});
+      queue.shift();
+      if (r.auth) { queue.length = 0; authFail(); break; }
+      handleResult(it, r);
+    }
+  } finally { working = false; }
+}
+function handleResult(it, r) {
+  // jika kiriman pertama sempat sampai tapi balasannya terblokir, kirim ulang dijawab "sudah discan": itu berarti BERHASIL
   const okRetry = r.dup && r.viaRetry && r.age != null && r.age >= 0 && r.age < 180;
   if (r.ok || okRetry) {
-    lastId = r.id || ids[0];
+    const id = r.id || it.ids[0], jasa = r.jasa || '⚠ kolom Kurir kosong';
+    lastId = id; known[id.toUpperCase()] = 1;
     if (r.ok) $('cnt').textContent = 'Hari ini: ' + r.count + ' paket'; else refreshToday();
-    beep(true); res('ok', '✔ No. ' + (r.no || '?'), lastId + ' · ' + (r.jasa || '⚠ kolom Kurir kosong')); $('btnUndo').style.display = 'block';
+    it.h.t = '✔ No. ' + (r.no || '?') + ' · ' + id + ' · ' + jasa;
+    beep(true); res('ok', '✔ No. ' + (r.no || '?'), id + ' · ' + jasa);
+    $('btnUndo').style.display = 'block'; $('btnUndo').textContent = '↩ Batalkan ' + id;
   } else if (r.net) {
+    plainKeys(it.ids).forEach(k => { delete known[k]; });
+    it.h.t = '❌ ' + it.ids[0] + ' - koneksi terputus, scan ulang';
     beep(false); res('err', '❌ Koneksi terputus', (r.error || '') + ' Scan ulang paket ini. Jika muncul SUDAH DISCAN, berarti sudah tersimpan.');
     setTimeout(() => { seen = []; prev = []; }, 3000);
   } else {
+    if (!r.dup) plainKeys(it.ids).forEach(k => { delete known[k]; });
+    it.h.t = '❌ ' + it.ids[0] + ' - ' + (r.dup ? 'SUDAH DISCAN' : (r.error || 'gagal'));
     beep(false); res('err', r.dup ? '❌ SUDAH DISCAN' : '❌ Gagal', r.error || 'Coba lagi');
   }
+  renderHist();
 }
 
 // ===== Kamera live =====
@@ -293,14 +334,17 @@ async function startCam() {
     } catch (e) {}
     scanning = true; seen = []; prev = []; misses = 0; $('camMsg').textContent = '';
     $('camBox').style.display = 'block'; $('btnCam').textContent = '⏹ BERHENTI SCAN'; $('btnCam').className = 'scanbtn on';
-    res('idle', 'Kamera aktif', 'Arahkan ke label paket, tahan sebentar'); loop();
+    res('idle', 'Kamera aktif', 'Arahkan ke label paket, tahan sebentar');
+    clearInterval(pingTimer);   // jaga server tetap "hangat" supaya scan pertama setelah diam tidak lambat
+    pingTimer = setInterval(() => { if (!working) api('today', {}, 20000).then(r => { if (r && r.ok) $('cnt').textContent = 'Hari ini: ' + r.count + ' paket'; }); }, 240000);
+    loop(0);
   } catch (e) {
     stopCam();
     $('camMsg').textContent = 'Kamera tidak bisa dibuka (' + (e && e.name || 'error') + '). Izinkan kamera di browser, atau pakai "Scan dari foto".';
   }
 }
 function stopCam() {
-  scanning = false; clearTimeout(timer); seen = []; prev = [];
+  scanning = false; clearTimeout(timer); clearInterval(pingTimer); seen = []; prev = [];
   if (stream) { try { stream.getTracks().forEach(t => t.stop()); } catch (e) {} stream = null; }
   try { $('vid').srcObject = null; } catch (e) {}
   $('camBox').style.display = 'none'; $('btnTorch').style.display = 'none';
@@ -309,9 +353,10 @@ function stopCam() {
 $('btnTorch').onclick = () => {
   try { const tr = stream.getVideoTracks()[0]; torchOn = !torchOn; tr.applyConstraints({advanced: [{torch: torchOn}]}).catch(() => {}); } catch (e) {}
 };
-function loop() {
+function loop(delay) {
   timer = setTimeout(async () => {
     if (!scanning) return;
+    const t0 = Date.now();
     try {
       const v = $('vid');
       if (!busy && v.videoWidth) {
@@ -320,18 +365,18 @@ function loop() {
         const s = Math.min(1, 960 / Math.max(work.width, work.height));              // dibaca di ukuran lebih kecil = lebih cepat
         dwork.width = Math.max(1, Math.round(work.width * s)); dwork.height = Math.max(1, Math.round(work.height * s));
         dwork.getContext('2d', {willReadFrequently: true}).drawImage(work, 0, 0, dwork.width, dwork.height);
-        const ids = await decodeAll(dwork, false);
+        const ids = await decodeAll(dwork, false, true);
         if (ids.length) {
           misses = 0;
-          const known = ids.some(x => seen.indexOf(x) >= 0);                         // paket yang baru disimpan, masih di layar
-          const twice = ids.some(x => prev.indexOf(x) >= 0);                         // terbaca 2x berturut-turut = akurat
+          const already = ids.some(x => seen.indexOf(x) >= 0);                       // paket yang baru dibaca, masih di layar
+          const twice = ids.some(x => prev.indexOf(x) >= 0);                         // QR jelas: langsung; barcode batang: 2x berturut-turut
           prev = ids;
-          if (!known && twice && !busy && scanning) { seen = ids.slice(); submit(ids, shotOf(work)); }
+          if (!already && (ids.strong || twice) && scanning) { seen = ids.slice(); enqueue(ids, shotOf(work)); }
         } else if (++misses >= 3) { seen = []; prev = []; }                          // kode sudah hilang dari layar
       }
     } catch (e) {}
-    if (scanning) loop();
-  }, 250);
+    if (scanning) loop(Math.max(20, 100 - (Date.now() - t0)));
+  }, delay);
 }
 $('btnCam').onclick = () => { if (scanning) stopCam(); else startCam(); };
 document.addEventListener('visibilitychange', () => { if (document.hidden) stopCam(); });
@@ -354,14 +399,14 @@ $('fileScan').onchange = async e => {
     const passes = [[1000, false], [640, false], [1600, true], [2400, true]];
     let ids = [];
     for (let i = 0; i < passes.length && !ids.length; i++) {
-      ids = await decodeAll(shrink(img, passes[i][0]), passes[i][1]);
+      ids = await decodeAll(shrink(img, passes[i][0]), passes[i][1], false);
       if (!ids.length) await new Promise(r => setTimeout(r, 0));
     }
-    if (!ids.length) { setBusy(false); beep(false); res('err', '❌ Kode tidak terbaca', 'Foto lebih dekat & terang, lalu scan ulang'); return; }
-    await submit(ids, shotOf(img));
+    if (!ids.length) { beep(false); res('err', '❌ Kode tidak terbaca', 'Foto lebih dekat & terang, lalu scan ulang'); }
+    else enqueue(ids, shotOf(img));       // langsung bebas untuk foto berikutnya, simpan berjalan di latar
   } catch (x) {
-    setBusy(false); beep(false); res('err', '❌ Foto tidak bisa dibuka', (x && x.message || 'error') + ' - ulangi scan');
-  }
+    beep(false); res('err', '❌ Foto tidak bisa dibuka', (x && x.message || 'error') + ' - ulangi scan');
+  } finally { setBusy(false); }
 };
 $('fileManual').onchange = async e => {
   const f = e.target.files[0]; e.target.value = '';
@@ -369,22 +414,26 @@ $('fileManual').onchange = async e => {
   const id = $('manual').value.trim();
   if (!id) { res('err', 'Isi ID paket dulu', ''); return; }
   setBusy(true); res('info', 'Memproses foto...', id);
-  let shot;
-  try { shot = shotOf(await loadAny(f)); } catch (x) {
-    try { shot = await rawShot(f); } catch (y) { setBusy(false); res('err', '❌ Foto gagal', y.message); return; }
-  }
-  $('manual').value = ''; await submit([id], shot);
+  try {
+    let shot;
+    try { shot = shotOf(await loadAny(f)); } catch (x) { shot = await rawShot(f); }
+    $('manual').value = ''; enqueue([id], shot);
+  } catch (y) { res('err', '❌ Foto gagal', y.message); }
+  finally { setBusy(false); }
 };
 
 // ===== Batal =====
 $('btnUndo').onclick = async () => {
-  if (!lastId || busy) return;
-  const id = lastId; setBusy(true); res('info', 'Membatalkan...', id);
+  if (!lastId || undoing) return;
+  const id = lastId; undoing = true; $('btnUndo').disabled = true; res('info', 'Membatalkan...', id);
   const r = await api('undo', {id: id});
-  setBusy(false);
+  undoing = false; $('btnUndo').disabled = false;
   if (r.auth) { authFail(); return; }
-  if (r.ok) { lastId = ''; $('btnUndo').style.display = 'none'; $('cnt').textContent = 'Hari ini: ' + r.count + ' paket'; res('idle', 'Dibatalkan', id + ' bisa discan ulang'); seen = []; prev = []; }
-  else res('err', '❌ Gagal batal', r.error || 'Coba lagi');
+  if (r.ok) {
+    lastId = ''; delete known[id.toUpperCase()]; $('btnUndo').style.display = 'none';
+    $('cnt').textContent = 'Hari ini: ' + r.count + ' paket'; res('idle', 'Dibatalkan', id + ' bisa discan ulang');
+    hist.unshift({s: 'undo', t: '↩ ' + id + ' - dibatalkan'}); renderHist(); seen = []; prev = [];
+  } else res('err', '❌ Gagal batal', r.error || 'Coba lagi');
 };
 
 // ===== Admin: hapus data lama =====
